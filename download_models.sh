@@ -24,7 +24,9 @@
 # =============================================================================
 set -euo pipefail
 
-MODELS_DIR="${COMFYUI_DIR:-/app/ComfyUI}/models"
+# MODELS_DIR puede venir como variable de entorno (p.ej. /runpod-volume/models)
+# Si no se pasa, usa la ruta local de ComfyUI (comportamiento por defecto)
+MODELS_DIR="${MODELS_DIR:-${COMFYUI_DIR:-/app/ComfyUI}/models}"
 HF_TOKEN="${HF_TOKEN:-}"
 
 # ── Helper de descarga ────────────────────────────────────────────────────────
