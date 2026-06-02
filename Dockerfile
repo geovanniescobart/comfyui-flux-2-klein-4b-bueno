@@ -4,17 +4,23 @@
 #
 # CÓMO CONSTRUIR Y PUBLICAR:
 #
+#   IMPORTANTE: el contexto de build es la carpeta runpod/ (no la raíz del proyecto).
+#   Ejecutar siempre desde la raíz del repo con -f y contexto explícito:
+#
 #   # Opción A: modelos descargados AL CONSTRUIR la imagen (imagen ~12 GB)
 #   # Ventaja: cold start rápido (~30s). Desventaja: imagen grande, build lento.
-#   docker build \
+#   docker build -f runpod/Dockerfile \
 #     --build-arg HF_TOKEN=hf_xxxx \
 #     --build-arg BAKE_MODELS=true \
-#     -t tuusuario/comfyui-flux2-klein:latest .
+#     -t tuusuario/comfyui-flux2-klein:latest \
+#     runpod/
 #
 #   # Opción B: sin modelos en la imagen (imagen ~6 GB)
 #   # Ventaja: imagen pequeña. Desventaja: primer arranque descarga ~10 GB.
 #   # → Recomendado usar RunPod Network Volume para persistir modelos.
-#   docker build -t tuusuario/comfyui-flux2-klein:latest .
+#   docker build -f runpod/Dockerfile \
+#     -t tuusuario/comfyui-flux2-klein:latest \
+#     runpod/
 #
 #   # Publicar en Docker Hub (RunPod necesita la imagen en un registry público)
 #   docker push tuusuario/comfyui-flux2-klein:latest
@@ -76,9 +82,10 @@ RUN mkdir -p \
     user/default/workflows
 
 # ── Copiar archivos del proyecto ──────────────────────────────────────────────
-COPY Workflows/                         ${COMFYUI_DIR}/user/default/workflows/
-COPY runpod/handler.py                  /app/handler.py
-COPY runpod/download_models.sh          /app/download_models.sh
+# Contexto de build = runpod/ → las rutas son relativas a esa carpeta.
+# El workflow NO se copia aquí: se recibe en cada request via input.workflow.
+COPY handler.py          /app/handler.py
+COPY download_models.sh  /app/download_models.sh
 RUN chmod +x /app/download_models.sh
 
 # ── Descarga de modelos durante el build (solo si BAKE_MODELS=true) ───────────
