@@ -38,7 +38,7 @@
 
 # -- Imagen base: AI Dock ComfyUI ---------------------------------------------
 # Incluye: ComfyUI clonado en /opt/ComfyUI, PyTorch, xformers, CUDA, wget, git
-FROM ghcr.io/ai-dock/comfyui:latest-cuda-12.1.0-base-22.04
+FROM runpod/worker-comfyui:5.1.0-base
 
 # -- Variables ----------------------------------------------------------------
 # AI Dock instala ComfyUI en /opt/ComfyUI
