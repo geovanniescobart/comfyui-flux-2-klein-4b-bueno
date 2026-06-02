@@ -1,107 +1,89 @@
 # =============================================================================
-# Dockerfile — ComfyUI Serverless para RunPod (FLUX.2 Klein 4B)
+# Dockerfile -- ComfyUI Serverless para RunPod (FLUX.2 Klein 4B)
 # =============================================================================
 #
-# CÓMO CONSTRUIR Y PUBLICAR:
+# BASE IMAGE: ghcr.io/ai-dock/comfyui
+#   Ya incluye: ComfyUI en /opt/ComfyUI, PyTorch 2.2, xformers, CUDA 12.1,
+#               todas las dependencias del sistema.
+#   Solo agregamos: RunPod SDK, handler y scripts de descarga de modelos.
+#   Build: ~2-3 min en lugar de ~15-20 min con la imagen anterior.
 #
-#   IMPORTANTE: el contexto de build es la carpeta runpod/ (no la raíz del proyecto).
-#   Ejecutar siempre desde la raíz del repo con -f y contexto explícito:
+# IMPORTANTE: contexto de build = carpeta runpod/ (no la raiz del proyecto)
 #
-#   # Opción A: modelos descargados AL CONSTRUIR la imagen (imagen ~12 GB)
-#   # Ventaja: cold start rápido (~30s). Desventaja: imagen grande, build lento.
+#   # Opcion A: modelos bakeados en la imagen (~12 GB, cold start rapido ~30s)
 #   docker build -f runpod/Dockerfile \
 #     --build-arg HF_TOKEN=hf_xxxx \
 #     --build-arg BAKE_MODELS=true \
 #     -t tuusuario/comfyui-flux2-klein:latest \
 #     runpod/
 #
-#   # Opción B: sin modelos en la imagen (imagen ~6 GB)
-#   # Ventaja: imagen pequeña. Desventaja: primer arranque descarga ~10 GB.
-#   # → Recomendado usar RunPod Network Volume para persistir modelos.
+#   # Opcion B: sin modelos, usar Network Volume (recomendado para produccion)
 #   docker build -f runpod/Dockerfile \
 #     -t tuusuario/comfyui-flux2-klein:latest \
 #     runpod/
 #
-#   # Publicar en Docker Hub (RunPod necesita la imagen en un registry público)
 #   docker push tuusuario/comfyui-flux2-klein:latest
 #
-# CÓMO CREAR EL ENDPOINT EN RUNPOD:
-#   1. Ir a https://www.runpod.io/console/serverless
-#   2. "New Endpoint" → "Custom Source"
-#   3. Docker Image: tuusuario/comfyui-flux2-klein:latest
-#   4. Container Disk: 20 GB (o más si horneas modelos)
-#   5. GPU: RTX 4090 / A100 (mínimo 24 GB VRAM para FLUX)
-#   6. Environment Variables:
-#        HF_TOKEN = hf_xxxx   (si usas Opción B)
-#   7. Si usas Network Volume: montarlo en /runpod-volume/models
-#      y el entrypoint enlazará simbólicamente los modelos.
+# CREAR ENDPOINT EN RUNPOD:
+#   1. Serverless -> New Endpoint -> Custom Source
+#   2. Docker Image: tuusuario/comfyui-flux2-klein:latest
+#   3. Container Disk: 20 GB | GPU: RTX 4090 / A100 (min 24 GB VRAM)
+#   4. Env vars: HF_TOKEN=hf_xxxx
+#   5. Network Volume montado en /runpod-volume (para persistir modelos)
+#
+# TAGS DISPONIBLES de ai-dock/comfyui:
+#   https://github.com/ai-dock/comfyui/pkgs/container/comfyui
+#   Ejemplos: latest-cuda-12.1.0-base-22.04 | latest-cuda-12.3.2-base-22.04
 # =============================================================================
 
-FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
+# -- Imagen base: AI Dock ComfyUI ---------------------------------------------
+# Incluye: ComfyUI clonado en /opt/ComfyUI, PyTorch, xformers, CUDA, wget, git
+FROM ghcr.io/ai-dock/comfyui:latest-cuda-12.1.0-base-22.04
 
-# ── Variables ─────────────────────────────────────────────────────────────────
-ENV COMFYUI_DIR=/app/ComfyUI \
+# -- Variables ----------------------------------------------------------------
+# AI Dock instala ComfyUI en /opt/ComfyUI
+ENV COMFYUI_DIR=/opt/ComfyUI \
     DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# ARG disponible solo durante el build (no queda en la imagen final)
 ARG HF_TOKEN=""
-# Si BAKE_MODELS=true, los modelos se descargan dentro del build
 ARG BAKE_MODELS="false"
 
-# ── Dependencias de sistema ───────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    wget \
-    curl \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+# -- Instalar RunPod SDK y requests -------------------------------------------
+# torch, xformers y los requisitos de ComfyUI ya estan en la imagen base.
+# pip3 apunta al entorno Python de la imagen (micromamba/venv de AI Dock).
+RUN pip3 install --upgrade pip && \
+    pip3 install runpod requests
 
-# ── Clonar ComfyUI ────────────────────────────────────────────────────────────
-# --depth 1 para no descargar todo el historial de git (imagen más pequeña)
-RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git ${COMFYUI_DIR}
-
-WORKDIR ${COMFYUI_DIR}
-
-# ── Dependencias Python ───────────────────────────────────────────────────────
-# requirements.txt incluye: torch (ya instalado en la base), xformers, etc.
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt && \
-    pip install runpod requests
-
-# ── Estructura de directorios ─────────────────────────────────────────────────
+# -- Estructura de directorios de modelos -------------------------------------
 RUN mkdir -p \
-    models/text_encoders \
-    models/diffusion_models \
-    models/vae \
-    input \
-    output \
-    user/default/workflows
+    ${COMFYUI_DIR}/models/text_encoders \
+    ${COMFYUI_DIR}/models/diffusion_models \
+    ${COMFYUI_DIR}/models/vae \
+    ${COMFYUI_DIR}/input \
+    ${COMFYUI_DIR}/output
 
-# ── Copiar archivos del proyecto ──────────────────────────────────────────────
-# Contexto de build = runpod/ → las rutas son relativas a esa carpeta.
-# El workflow NO se copia aquí: se recibe en cada request via input.workflow.
+# -- Copiar handler y script de descarga --------------------------------------
+# Contexto de build = runpod/ -> rutas relativas a esa carpeta.
+# El workflow NO va en la imagen: llega en cada request via input.workflow.
 COPY handler.py          /app/handler.py
 COPY download_models.sh  /app/download_models.sh
 RUN chmod +x /app/download_models.sh
 
-# ── Descarga de modelos durante el build (solo si BAKE_MODELS=true) ───────────
-#
-# Si prefieres RunPod Network Volume (recomendado para producción):
-#   - No hornees los modelos aquí (deja BAKE_MODELS=false)
-#   - Monta el volumen en /runpod-volume/models desde el panel de RunPod
-#   - El handler.py crea symlinks automáticamente al arrancar
-#
+# -- Descarga de modelos durante el build (solo Opcion A: BAKE_MODELS=true) ---
+# Con Network Volume (Opcion B): dejar BAKE_MODELS=false.
+# El handler descargara al volumen en el primer arranque y los persistira.
 RUN if [ "$BAKE_MODELS" = "true" ]; then \
-    echo "[build] Descargando modelos FLUX.2 Klein 4B..." && \
-    HF_TOKEN="${HF_TOKEN}" COMFYUI_DIR="${COMFYUI_DIR}" /app/download_models.sh; \
+        echo "[build] Descargando modelos FLUX.2 Klein 4B..." && \
+        HF_TOKEN="${HF_TOKEN}" COMFYUI_DIR="${COMFYUI_DIR}" /app/download_models.sh; \
     else \
-    echo "[build] BAKE_MODELS=false — modelos se descargarán en arranque o desde Network Volume"; \
+        echo "[build] BAKE_MODELS=false -- modelos desde Network Volume o primer arranque"; \
     fi
 
-# ── Comando de inicio ─────────────────────────────────────────────────────────
-# handler.py levanta ComfyUI en background y luego inicia el worker de RunPod
-CMD ["python", "-u", "/app/handler.py"]
+# -- Sobreescribir el entrypoint de AI Dock -----------------------------------
+# AI Dock usa supervisord como ENTRYPOINT por defecto.
+# Lo reemplazamos con nuestro handler de RunPod.
+# handler.py levanta ComfyUI como subproceso internamente.
+ENTRYPOINT []
+CMD ["python3", "-u", "/app/handler.py"]
