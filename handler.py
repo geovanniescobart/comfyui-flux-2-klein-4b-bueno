@@ -6,36 +6,34 @@ handler.py — RunPod Serverless Worker para ComfyUI FLUX.2 Klein 4B
 FLUJO DE EJECUCIÓN:
   1. Al arrancar el contenedor (startup):
      a. Si existe /runpod-volume/models → crea symlinks hacia ComfyUI/models
-        (permite usar RunPod Network Volume sin copiar archivos)
      b. Si los modelos no están y HF_TOKEN existe → los descarga con download_models.sh
      c. Levanta ComfyUI en segundo plano (puerto 8188, solo localhost)
      d. Espera que ComfyUI esté listo (~20-60s)
      e. Inicia el worker de RunPod (empieza a aceptar jobs)
 
   2. Por cada job recibido (handler):
-     a. Decodifica y sube las imágenes de entrada a ComfyUI (/upload/image)
-     b. Encola el workflow (/prompt)
-     c. Hace polling hasta que termine (/history/{prompt_id})
-     d. Descarga las imágenes de salida y las retorna como base64
+     a. Sube la imagen al ComfyUI local
+     b. Inyecta el prompt y el nombre de imagen en el workflow embebido
+     c. Encola el workflow en ComfyUI (/prompt)
+     d. Hace polling hasta que termine (/history/{prompt_id})
+     e. Retorna las imágenes de salida como base64
 
-REQUEST esperado (compatible con RunPodService.cs):
+REQUEST (simplificado — el workflow vive en el servidor):
   POST https://api.runpod.ai/v2/{endpoint_id}/runsync
   {
     "input": {
-      "workflow": { ...ComfyUI workflow en formato API... },
-      "images": [
-        { "name": "selfie.png",     "image": "<base64>" },
-        { "name": "instagram.png",  "image": "<base64>" }
-      ]
+      "prompt": "change her t-shirt to pink pastel",
+      "image":  "<base64>",
+      "seed":   42,        ← opcional (default: aleatorio)
+      "steps":  20,        ← opcional (default: 20)
+      "cfg":    5.0        ← opcional (default: 5.0)
     }
   }
 
 RESPONSE:
   {
     "output": {
-      "images": [
-        { "data": "<base64>" }
-      ]
+      "images": [ { "data": "<base64>" } ]
     }
   }
 """
@@ -230,6 +228,110 @@ def collect_output_images(history: dict) -> list[dict]:
 
 
 # =============================================================================
+# Workflow embebido — FLUX.2 Klein 4B Image Edit
+# El cliente solo necesita enviar: prompt + image (base64)
+# =============================================================================
+
+IMAGE_INPUT_NODE = "76"   # LoadImage
+PROMPT_NODE = "74"   # CLIPTextEncode positivo
+SEED_NODE = "73"   # RandomNoise
+STEPS_NODE = "62"   # Flux2Scheduler
+CFG_NODE = "63"   # CFGGuider
+IMAGE_FILENAME = "input_image.jpeg"
+
+BASE_WORKFLOW: dict = {
+    "76": {
+        "class_type": "LoadImage",
+        "inputs": {"image": IMAGE_FILENAME, "upload": "image"}
+    },
+    "80": {
+        "class_type": "ImageScaleToTotalPixels",
+        "inputs": {"image": ["76", 0], "upscale_method": "nearest-exact", "megapixels": 1.0}
+    },
+    "100": {
+        "class_type": "GetImageSize",
+        "inputs": {"image": ["80", 0]}
+    },
+    "70": {
+        "class_type": "UNETLoader",
+        "inputs": {"unet_name": "FLUX.2-klein/flux-2-klein-base-4b-fp8.safetensors", "weight_dtype": "default"}
+    },
+    "71": {
+        "class_type": "CLIPLoader",
+        "inputs": {"clip_name": "qwen_3_4b.safetensors", "type": "flux2", "device": "default"}
+    },
+    "72": {
+        "class_type": "VAELoader",
+        "inputs": {"vae_name": "flux2-dev/flux2-vae.safetensors"}
+    },
+    "73": {
+        "class_type": "RandomNoise",
+        "inputs": {"noise_seed": 42}
+    },
+    "74": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"clip": ["71", 0], "text": ""}
+    },
+    "67": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"clip": ["71", 0], "text": ""}
+    },
+    "78": {
+        "class_type": "VAEEncode",
+        "inputs": {"pixels": ["80", 0], "vae": ["72", 0]}
+    },
+    "77": {
+        "class_type": "ReferenceLatent",
+        "inputs": {"conditioning": ["74", 0], "latent": ["78", 0]}
+    },
+    "101": {
+        "class_type": "ReferenceLatent",
+        "inputs": {"conditioning": ["67", 0], "latent": ["78", 0]}
+    },
+    "61": {
+        "class_type": "KSamplerSelect",
+        "inputs": {"sampler_name": "euler"}
+    },
+    "62": {
+        "class_type": "Flux2Scheduler",
+        "inputs": {"steps": 20, "width": ["100", 0], "height": ["100", 1]}
+    },
+    "66": {
+        "class_type": "EmptyFlux2LatentImage",
+        "inputs": {"width": ["100", 0], "height": ["100", 1], "batch_size": 1}
+    },
+    "63": {
+        "class_type": "CFGGuider",
+        "inputs": {"model": ["70", 0], "positive": ["77", 0], "negative": ["101", 0], "cfg": 5.0}
+    },
+    "64": {
+        "class_type": "SamplerCustomAdvanced",
+        "inputs": {"noise": ["73", 0], "guider": ["63", 0], "sampler": ["61", 0], "sigmas": ["62", 0], "latent_image": ["66", 0]}
+    },
+    "65": {
+        "class_type": "VAEDecode",
+        "inputs": {"samples": ["64", 0], "vae": ["72", 0]}
+    },
+    "9": {
+        "class_type": "SaveImage",
+        "inputs": {"filename_prefix": "Flux2-Klein-4b-base", "images": ["65", 0]}
+    }
+}
+
+
+def build_workflow(prompt: str, image_name: str, seed: int, steps: int, cfg: float) -> dict:
+    """Clona el workflow base e inyecta los parámetros del request."""
+    import copy
+    wf = copy.deepcopy(BASE_WORKFLOW)
+    wf[IMAGE_INPUT_NODE]["inputs"]["image"] = image_name
+    wf[PROMPT_NODE]["inputs"]["text"] = prompt
+    wf[SEED_NODE]["inputs"]["noise_seed"] = seed
+    wf[STEPS_NODE]["inputs"]["steps"] = steps
+    wf[CFG_NODE]["inputs"]["cfg"] = cfg
+    return wf
+
+
+# =============================================================================
 # RunPod handler
 # =============================================================================
 
@@ -238,36 +340,43 @@ def handler(job: dict) -> dict:
     Handler principal invocado por RunPod por cada job.
 
     job["input"] debe contener:
-      - workflow (dict)  : el workflow en formato API de ComfyUI
-      - images   (list)  : lista de {"name": str, "image": "<base64>"}
+      - prompt (str)         : instrucción de edición
+      - image  (str)         : imagen de entrada en base64
+      - seed   (int)         : opcional, default aleatorio
+      - steps  (int)         : opcional, default 20
+      - cfg    (float)       : opcional, default 5.0
 
     Retorna:
-      {"images": [{"data": "<base64>"}, ...]}
+      {"images": [{"data": "<base64>"}]}
     o en caso de error:
       {"error": "<mensaje>"}
     """
     job_input = job.get("input", {})
-    workflow = job_input.get("workflow")
-    images = job_input.get("images", [])
+    prompt = job_input.get("prompt", "")
+    image_b64 = job_input.get("image", "")
+    seed = int(job_input.get("seed",  __import__('random').randint(0, 2**32)))
+    steps = int(job_input.get("steps", 20))
+    cfg = float(job_input.get("cfg",  5.0))
 
-    if not workflow:
-        return {"error": "Campo 'workflow' ausente en el input."}
+    if not prompt:
+        return {"error": "Campo 'prompt' ausente en el input."}
+    if not image_b64:
+        return {"error": "Campo 'image' (base64) ausente en el input."}
 
     try:
-        # 1. Subir imágenes de entrada
-        for img_entry in images:
-            name = img_entry.get("name", "image.png")
-            b64data = img_entry.get("image", "")
-            if b64data:
-                upload_image(name, b64data)
+        # 1. Subir imagen de entrada
+        saved_name = upload_image(IMAGE_FILENAME, image_b64)
 
-        # 2. Encolar workflow
+        # 2. Construir workflow con los parámetros del request
+        workflow = build_workflow(prompt, saved_name, seed, steps, cfg)
+
+        # 3. Encolar workflow
         prompt_id = queue_workflow(workflow)
 
-        # 3. Esperar resultado
+        # 4. Esperar resultado
         history = poll_history(prompt_id)
 
-        # 4. Recopilar y retornar imágenes de salida
+        # 5. Recopilar y retornar imágenes de salida
         output_images = collect_output_images(history)
         return {"images": output_images}
 
